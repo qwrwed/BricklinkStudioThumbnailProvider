@@ -36,9 +36,34 @@ static const CLSID CLSID_IoThumbnailProvider =
     {0xE7E4677B, 0x5BBF, 0x4459,
      {0xBD, 0xCF, 0xA9, 0x7A, 0xE3, 0xBE, 0x21, 0xC8}};
 
-static LONG      g_cDllRef      = 0;
-static HINSTANCE g_hInst        = nullptr;
-static ULONG_PTR g_gdiplusToken = 0;
+static LONG      g_cDllRef = 0;
+static HINSTANCE g_hInst   = nullptr;
+
+// ---------------------------------------------------------------------------
+// GDI+ lifetime, scoped to a single GetThumbnail call.
+//
+// GdiplusStartup must not be called from DllMain; doing so here hung
+// CoCreateInstance indefinitely, before the provider was ever reached.
+// Per-call startup/shutdown is one of the three approaches Microsoft
+// documents for a DLL that uses GDI+:
+//   https://learn.microsoft.com/en-us/windows/win32/api/gdiplusinit/nf-gdiplusinit-gdiplusstartup
+// ---------------------------------------------------------------------------
+struct GdiplusSession
+{
+    ULONG_PTR       token;
+    Gdiplus::Status status;
+
+    GdiplusSession() : token(0)
+    {
+        Gdiplus::GdiplusStartupInput si;
+        status = Gdiplus::GdiplusStartup(&token, &si, nullptr);
+    }
+
+    ~GdiplusSession()
+    {
+        if (status == Gdiplus::Ok) Gdiplus::GdiplusShutdown(token);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Read all bytes from an IStream into a heap buffer (CoTaskMemAlloc).
@@ -69,7 +94,103 @@ static HRESULT StreamToBytes(IStream* pStream, BYTE** ppData, DWORD* pSize)
 }
 
 // ---------------------------------------------------------------------------
-// Extract thumbnail.png from an in-memory ZIP using miniz.
+// Studio writes some .io files as ZipCrypto-encrypted archives, using one
+// static password documented as the container's format:
+//   https://wiki.ldraw.org/wiki/IO
+// miniz has no decryption support, so those entries are decrypted here and
+// then handed to miniz's inflate.
+// ---------------------------------------------------------------------------
+static const char* const IO_ZIP_PASSWORD = "soho0909";
+
+namespace zipcrypto {
+
+static mz_uint32 Crc32Update(mz_uint32 crc, BYTE b)
+{
+    return mz_crc32(crc ^ 0xFFFFFFFFu, &b, 1) ^ 0xFFFFFFFFu;
+}
+
+struct Keys
+{
+    mz_uint32 k0, k1, k2;
+
+    explicit Keys(const char* password) : k0(305419896u), k1(591751049u), k2(878082192u)
+    {
+        for (const char* p = password; *p; ++p)
+            Update(static_cast<BYTE>(*p));
+    }
+
+    void Update(BYTE b)
+    {
+        k0 = Crc32Update(k0, b);
+        k1 = k1 + (k0 & 0xFFu);
+        k1 = k1 * 134775813u + 1u;
+        k2 = Crc32Update(k2, static_cast<BYTE>(k1 >> 24));
+    }
+
+    BYTE StreamByte() const
+    {
+        mz_uint32 temp = (k2 & 0xFFFFu) | 2u;
+        return static_cast<BYTE>(((temp * (temp ^ 1u)) >> 8) & 0xFFu);
+    }
+
+    BYTE Decrypt(BYTE c)
+    {
+        BYTE plain = static_cast<BYTE>(c ^ StreamByte());
+        Update(plain);
+        return plain;
+    }
+};
+
+} // namespace zipcrypto
+
+// Decrypt and inflate one encrypted entry. Returns a buffer to free with mz_free.
+static HRESULT ExtractEncryptedEntry(const BYTE* zipData, DWORD zipLen,
+                                      const mz_zip_archive_file_stat& st,
+                                      void** ppOut, size_t* pOutLen)
+{
+    // Local header: 30 fixed bytes, then filename and extra field.
+    const mz_uint64 lho = st.m_local_header_ofs;
+    if (lho + 30 > zipLen) return E_FAIL;
+
+    const BYTE* lh = zipData + lho;
+    const mz_uint16 nameLen  = static_cast<mz_uint16>(lh[26] | (lh[27] << 8));
+    const mz_uint16 extraLen = static_cast<mz_uint16>(lh[28] | (lh[29] << 8));
+
+    const mz_uint64 dataOfs = lho + 30 + nameLen + extraLen;
+    const mz_uint64 compLen = st.m_comp_size;
+    if (compLen < 12 || dataOfs + compLen > zipLen) return E_FAIL;
+
+    // First 12 bytes are the encryption header, not part of the payload.
+    const BYTE*  cipher     = zipData + dataOfs;
+    const size_t payloadLen = static_cast<size_t>(compLen) - 12;
+
+    BYTE* plain = static_cast<BYTE*>(CoTaskMemAlloc(payloadLen));
+    if (!plain) return E_OUTOFMEMORY;
+
+    zipcrypto::Keys keys(IO_ZIP_PASSWORD);
+    for (int i = 0; i < 12; ++i) keys.Decrypt(cipher[i]);
+    for (size_t i = 0; i < payloadLen; ++i) plain[i] = keys.Decrypt(cipher[12 + i]);
+
+    void*  out    = nullptr;
+    size_t outLen = 0;
+
+    if (st.m_method == 0) {
+        out = MZ_MALLOC(payloadLen ? payloadLen : 1);
+        if (out) { memcpy(out, plain, payloadLen); outLen = payloadLen; }
+    } else {
+        out = tinfl_decompress_mem_to_heap(plain, payloadLen, &outLen, 0);
+    }
+
+    CoTaskMemFree(plain);
+    if (!out) return E_FAIL;
+
+    *ppOut   = out;
+    *pOutLen = outLen;
+    return S_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Extract thumbnail.png from an in-memory ZIP, encrypted or not.
 // Returns a buffer allocated by miniz (free with mz_free).
 // ---------------------------------------------------------------------------
 static HRESULT ExtractThumbnailPng(const BYTE* zipData, DWORD zipLen,
@@ -79,15 +200,24 @@ static HRESULT ExtractThumbnailPng(const BYTE* zipData, DWORD zipLen,
     if (!mz_zip_reader_init_mem(&zip, zipData, zipLen, 0))
         return E_FAIL;
 
-    void* pngData = mz_zip_reader_extract_file_to_heap(
-        &zip, "thumbnail.png", pPngLen, 0);
+    HRESULT hr = E_FAIL;
+    int index  = mz_zip_reader_locate_file(&zip, "thumbnail.png", nullptr, 0);
+
+    if (index >= 0) {
+        mz_zip_archive_file_stat st{};
+        if (mz_zip_reader_file_stat(&zip, static_cast<mz_uint>(index), &st)) {
+            if (st.m_bit_flag & 1) {
+                hr = ExtractEncryptedEntry(zipData, zipLen, st, ppPng, pPngLen);
+            } else {
+                void* pngData = mz_zip_reader_extract_to_heap(
+                    &zip, static_cast<mz_uint>(index), pPngLen, 0);
+                if (pngData) { *ppPng = pngData; hr = S_OK; }
+            }
+        }
+    }
 
     mz_zip_reader_end(&zip);
-
-    if (!pngData) return E_FAIL;
-
-    *ppPng = pngData;
-    return S_OK;
+    return hr;
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +280,9 @@ public:
     {
         *phbmp    = nullptr;
         *pdwAlpha = WTSAT_UNKNOWN;
+
+        GdiplusSession gdiplus;
+        if (gdiplus.status != Gdiplus::Ok) return E_FAIL;
 
         BYTE* zipData = nullptr;
         DWORD zipLen  = 0;
@@ -268,10 +401,6 @@ BOOL APIENTRY DllMain(HMODULE hMod, DWORD reason, LPVOID)
     if (reason == DLL_PROCESS_ATTACH) {
         g_hInst = hMod;
         DisableThreadLibraryCalls(hMod);
-        Gdiplus::GdiplusStartupInput si;
-        Gdiplus::GdiplusStartup(&g_gdiplusToken, &si, nullptr);
-    } else if (reason == DLL_PROCESS_DETACH) {
-        Gdiplus::GdiplusShutdown(g_gdiplusToken);
     }
     return TRUE;
 }
