@@ -1,0 +1,27 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build
+        shell: cmd
+        run: cl /LD /EHsc /O2 IoThumbnailProvider.cpp third_party\miniz\miniz.c /link /DEF:IoThumbnailProvider.def ole32.lib oleaut32.lib shlwapi.lib gdiplus.lib advapi32.lib shell32.lib /OUT:IoThumbnailProvider.dll
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: IoThumbnailProvider.dll
