@@ -30,7 +30,7 @@ cl /LD /EHsc /O2 IoThumbnailProvider.cpp third_party\miniz\miniz.c /link /DEF:Io
 1. Register the DLL from an elevated prompt:
 
 ```cmd
-regsvr32 path\to\IoThumbnailProvider.dll
+regsvr32 IoThumbnailProvider.dll
 ```
 
 2. Associate the handler with the `.io` file type:
