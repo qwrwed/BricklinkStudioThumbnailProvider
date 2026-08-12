@@ -27,39 +27,18 @@ cl /LD /EHsc /O2 IoThumbnailProvider.cpp third_party\miniz\miniz.c /link /DEF:Io
 
 ## Install
 
-1. Register the DLL from an elevated prompt:
-
-```cmd
-regsvr32 IoThumbnailProvider.dll
-```
-
-2. Associate the handler with the `.io` file type:
-
-```cmd
-reg add "HKCR\io_auto_file\shellex\{e357fccd-a995-4576-b01f-234630154e96}" /ve /t REG_SZ /d "{E7E4677B-5BBF-4459-BDCF-A97AE3BE21C8}" /f
-```
-
-3. Clear the thumbnail cache and restart Explorer:
-
-PowerShell:
+From an elevated PowerShell prompt, in this folder:
 
 ```powershell
-taskkill /f /im explorer.exe
-Remove-Item "$env:LocalAppData\Microsoft\Windows\Explorer\thumbcache_*.db" -Force
-Start-Process explorer
+.\AddIoThumbnailProvider.ps1
 ```
 
-cmd:
-
-```cmd
-taskkill /f /im explorer.exe
-del /f "%LocalAppData%\Microsoft\Windows\Explorer\thumbcache_*.db"
-start explorer
-```
+This copies the built DLL to `C:\ProgramData\ThumbnailProviders\Io\`, registers that copy, associates the handler with the `.io` file type, and clears Explorer's thumbnail cache. Registering the fixed copy rather than the DLL in this folder means this repo can be moved or renamed afterwards without breaking the registration - rerun the script (to refresh the installed copy) only after rebuilding the DLL, not after moving this folder.
 
 ## Uninstall
 
-```cmd
-regsvr32 /u IoThumbnailProvider.dll
-reg delete "HKCR\io_auto_file\shellex\{e357fccd-a995-4576-b01f-234630154e96}" /f
+From an elevated PowerShell prompt, in this folder:
+
+```powershell
+.\RemoveIoThumbnailProvider.ps1
 ```
